@@ -2,20 +2,6 @@
 
 This repository captures a lightweight prototype for fuel tracking across a mixed fleet and four mobile tankers (BPS-95, HSC-116, BPS-13, HSC-101). The goal is to keep Google Sheets as the system of record and feed a dashboard/Streamlit front-end for faster data entry and anomaly checks.
 
-## How to see the dashboard (Streamlit UI)
-
-1. Install Python 3.10+ and the dependencies in `requirements.txt` (Streamlit and pandas).
-2. From the repo root, run:
-   ```bash
-   streamlit run app.py
-   ```
-3. Open the printed local URL (usually http://localhost:8501). You will see three tabs:
-   - **Log Entry:** Type-to-search fleet numbers, pick the source tanker (or external station for refills), and append transactions. New entries write to local CSV logs (`Fuel_Log_Vehicles.csv`, `Fuel_Log_Tankers.csv`).
-   - **Analytics Dashboard:** KPIs, category/asset charts, and the latest transactions—populated by your saved log files.
-   - **Tanker Inventory:** Live balances per tanker using refills minus dispenses.
-
-If you continue to use Google Sheets as the backbone, point the app to a Sheets-backed CSV export (or swap the loader with the Sheets API). The Streamlit UI is what unlocks the dashboard view beyond this README.
-
 ## Current data snapshot
 
 The provided `Database.csv` contains 347 assets with four categories (Vehicles, Buses, Machines/Equipment, and Tankers). The tankers present are:
@@ -86,14 +72,6 @@ Runtime files created next to the app:
 
 - `Fuel_Log_Vehicles.csv` — append-only log of OUT transactions.
 - `Fuel_Log_Tankers.csv` — append-only log of IN receipts.
-
-## Next steps to run smoothly
-
-1. **Load your real assets** – replace `Database.csv` with your live asset master. Keep the column headers identical (`Fleet No`, `Asset ID`, `Category`, `Description`, `Plate Number`, `Benchmark_KmL` for vehicles). The app now blocks startup if any of these columns are missing.
-2. **Pre-seed tanker list** – ensure your four tanker records (BPS-95, HSC-116, BPS-13, HSC-101) are marked with `Category = Tanker`. If they are absent, the app falls back to these four codes automatically.
-3. **Point to Google Sheets** – swap the CSV loaders in `app.py` for Sheets API calls (see “Switching from CSV to Google Sheets”) and deploy your credentials as secrets.
-4. **Protect formulas and validation** – in Sheets, lock derived columns and enable dropdown+search validation for `Fleet No`, `Category`, and `Source Tanker` to prevent typos.
-5. **Monitor balances weekly** – reconcile the Tanker Inventory view with physical dip readings; adjust starting balances if you bring in legacy stock.
 
 ## Switching from CSV to Google Sheets
 
