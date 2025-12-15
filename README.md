@@ -73,6 +73,14 @@ Runtime files created next to the app:
 - `Fuel_Log_Vehicles.csv` — append-only log of OUT transactions.
 - `Fuel_Log_Tankers.csv` — append-only log of IN receipts.
 
+## Next steps to run smoothly
+
+1. **Load your real assets** – replace `Database.csv` with your live asset master. Keep the column headers identical (`Fleet No`, `Asset ID`, `Category`, `Description`, `Plate Number`, `Benchmark_KmL` for vehicles). The app now blocks startup if any of these columns are missing.
+2. **Pre-seed tanker list** – ensure your four tanker records (BPS-95, HSC-116, BPS-13, HSC-101) are marked with `Category = Tanker`. If they are absent, the app falls back to these four codes automatically.
+3. **Point to Google Sheets** – swap the CSV loaders in `app.py` for Sheets API calls (see “Switching from CSV to Google Sheets”) and deploy your credentials as secrets.
+4. **Protect formulas and validation** – in Sheets, lock derived columns and enable dropdown+search validation for `Fleet No`, `Category`, and `Source Tanker` to prevent typos.
+5. **Monitor balances weekly** – reconcile the Tanker Inventory view with physical dip readings; adjust starting balances if you bring in legacy stock.
+
 ## Switching from CSV to Google Sheets
 
 - Replace the `load_data`, `load_logs`, and `save_log` helpers in `app.py` with `gspread`/Sheets API calls to append rows to the four tabs described above. Keep the same column names so the UI continues working.
