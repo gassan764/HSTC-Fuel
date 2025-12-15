@@ -4,9 +4,15 @@ from datetime import datetime
 import os
 
 # --- CONFIGURATION ---
-DATABASE_FILE = 'Updated_Database.csv'
+# Default to the sample database bundled with the repo. Swap this with a Google Sheets
+# pull in production (see README for instructions).
+DATABASE_FILE = 'Database.csv'
 VEHICLE_LOG_FILE = 'Fuel_Log_Vehicles.csv'
 TANKER_LOG_FILE = 'Fuel_Log_Tankers.csv'
+TANKER_CODES = ['BPS-95', 'HSC-116', 'BPS-13', 'HSC-101']
+REQUIRED_DB_COLUMNS = {
+    'Fleet No', 'Asset ID', 'Category', 'Description', 'Plate Number'
+}
 
 # --- 1. LOAD DATA ---
 @st.cache_data
@@ -14,7 +20,17 @@ def load_data():
     if not os.path.exists(DATABASE_FILE):
         st.error(f"⚠️ Critical Error: '{DATABASE_FILE}' not found. Please save the database CSV in this folder.")
         return pd.DataFrame()
-    return pd.read_csv(DATABASE_FILE)
+
+    df = pd.read_csv(DATABASE_FILE)
+    missing_cols = REQUIRED_DB_COLUMNS - set(df.columns)
+    if missing_cols:
+        st.error(
+            "⚠️ Database file is missing required columns: "
+            + ", ".join(sorted(missing_cols))
+        )
+        return pd.DataFrame()
+
+    return df
 
 def load_logs(file_path, columns):
     if not os.path.exists(file_path):
@@ -38,7 +54,7 @@ if page == "📝 Log Entry":
     st.title("New Fuel Transaction")
 
     if db.empty:
-        st.warning("Database is empty. Please check Updated_Database.csv")
+        st.warning("Database is empty. Please check Database.csv")
         st.stop()
 
     # A. Choose Operation Type
@@ -52,10 +68,21 @@ if page == "📝 Log Entry":
         with col1:
             # --- THE SMART SEARCH FEATURE ---
             # Create a label for searching: "HSC-116 | FUEL TANKER (DA 4247)"
-            db['Search_Label'] = db['Fleet No'].astype(str) + " | " + db['Description'].astype(str) + " (" + db['Plate Number'].astype(str) + ")"
+            db_with_labels = db.copy()
+            db_with_labels['Search_Label'] = (
+                db_with_labels['Fleet No'].astype(str)
+                + " | "
+                + db_with_labels['Description'].astype(str)
+                + " ("
+                + db_with_labels['Plate Number'].astype(str)
+                + ")"
+            )
 
             # The Selectbox
-            selected_label = st.selectbox("🔍 Search Fleet No (Type to Search):", options=[""] + list(db['Search_Label'].unique()))
+            selected_label = st.selectbox(
+                "🔍 Search Fleet No (Type to Search):",
+                options=[""] + list(db_with_labels['Search_Label'].unique()),
+            )
 
             # Auto-fill logic
             fleet_no = None
@@ -64,7 +91,7 @@ if page == "📝 Log Entry":
 
             if selected_label:
                 # Find the row in the DB
-                asset_row = db[db['Search_Label'] == selected_label].iloc[0]
+                asset_row = db_with_labels[db_with_labels['Search_Label'] == selected_label].iloc[0]
 
                 st.success(f"**Selected:** {asset_row['Description']}")
 
@@ -81,7 +108,7 @@ if page == "📝 Log Entry":
             tankers = db[db['Category'] == 'Tanker']['Fleet No'].tolist()
             # Fallback if no tankers categorized
             if not tankers:
-                tankers = ['BPS-95', 'HSC-116', 'BPS-13', 'HSC-101']
+                tankers = TANKER_CODES
 
             source_tanker = st.selectbox("⛽ Source Tanker (Dispenser):", options=tankers)
 
@@ -129,7 +156,7 @@ if page == "📝 Log Entry":
         with col1:
             tankers = db[db['Category'] == 'Tanker']['Fleet No'].tolist()
             if not tankers:
-                tankers = ['BPS-95', 'HSC-116', 'BPS-13', 'HSC-101']
+                tankers = TANKER_CODES
             target_tanker = st.selectbox("Select Tanker Receiving Fuel:", options=tankers)
 
         with col2:
@@ -200,7 +227,7 @@ elif page == "🛢️ Tanker Inventory":
     t_log = load_logs(TANKER_LOG_FILE, ["Tanker No", "Fuel In (L)"])
     v_log = load_logs(VEHICLE_LOG_FILE, ["Source Tanker", "Fuel Out (L)"])
 
-    tankers = ['BPS-95', 'HSC-116', 'BPS-13', 'HSC-101']
+    tankers = TANKER_CODES
 
     col_grid = st.columns(2)
 
