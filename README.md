@@ -59,3 +59,22 @@ Keep everything in a single Google Sheet with four tabs. All entries are append-
 - If hosting on Streamlit Community Cloud or another PaaS, keep Google credentials in the platform’s secret manager.
 
 These changes make Google Sheets the single source of truth while still enabling fast dashboard entry with searchable dropdowns and automated validation.
+
+## Running the Streamlit demo locally
+
+1. Install dependencies: `pip install streamlit pandas`.
+2. Keep the provided `Database.csv` next to `app.py` (the app now points to this filename by default).
+3. Launch: `streamlit run app.py`.
+4. Use the **📝 Log Entry** tab to record dispensing (OUT) or tanker refills (IN).
+5. Review **📊 Analytics Dashboard** and **🛢️ Tanker Inventory** to validate totals.
+
+Runtime files created next to the app:
+
+- `Fuel_Log_Vehicles.csv` — append-only log of OUT transactions.
+- `Fuel_Log_Tankers.csv` — append-only log of IN receipts.
+
+## Switching from CSV to Google Sheets
+
+- Replace the `load_data`, `load_logs`, and `save_log` helpers in `app.py` with `gspread`/Sheets API calls to append rows to the four tabs described above. Keep the same column names so the UI continues working.
+- Store Google service account credentials in Streamlit secrets or environment variables.
+- If you need to point at a different sheet/tab during testing, export the sheet as CSV and drop it into the repo with the same filename, or wrap `DATABASE_FILE` with your connector function.
