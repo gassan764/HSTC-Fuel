@@ -4,7 +4,9 @@ from datetime import datetime
 import os
 
 # --- CONFIGURATION ---
-DATABASE_FILE = 'Updated_Database.csv'
+# Default to the sample database bundled with the repo. Swap this with a Google Sheets
+# pull in production (see README for instructions).
+DATABASE_FILE = 'Database.csv'
 VEHICLE_LOG_FILE = 'Fuel_Log_Vehicles.csv'
 TANKER_LOG_FILE = 'Fuel_Log_Tankers.csv'
 
