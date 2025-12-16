@@ -4,7 +4,7 @@ This repository captures a lightweight prototype for fuel tracking across a mixe
 
 ## Current data snapshot
 
-The provided `Database.csv` contains 347 assets with four categories (Vehicles, Buses, Machines/Equipment, and Tankers). The tankers present are:
+The provided `data/Database.csv` contains 347 assets with four categories (Vehicles, Buses, Machines/Equipment, and Tankers). The tankers present are:
 
 - **HSC-101** — Plate: HA 948
 - **HSC-116** — Plate: DA 4247
@@ -62,16 +62,16 @@ These changes make Google Sheets the single source of truth while still enabling
 
 ## Running the Streamlit demo locally
 
-1. Install dependencies: `pip install streamlit pandas`.
-2. Keep the provided `Database.csv` next to `app.py` (the app now points to this filename by default).
+1. Install dependencies: `pip install -r requirements.txt`.
+2. Ensure `data/Database.csv` exists (copy the sample provided in `data/` or replace it with your own export).
 3. Launch: `streamlit run app.py`.
 4. Use the **📝 Log Entry** tab to record dispensing (OUT) or tanker refills (IN).
 5. Review **📊 Analytics Dashboard** and **🛢️ Tanker Inventory** to validate totals.
 
-Runtime files created next to the app:
+Runtime files are written to the `outputs/` folder (gitignored by default):
 
-- `Fuel_Log_Vehicles.csv` — append-only log of OUT transactions.
-- `Fuel_Log_Tankers.csv` — append-only log of IN receipts.
+- `outputs/Fuel_Log_Vehicles.csv` — append-only log of OUT transactions.
+- `outputs/Fuel_Log_Tankers.csv` — append-only log of IN receipts.
 
 ## Switching from CSV to Google Sheets
 
