@@ -178,6 +178,184 @@ TANKER_RECEIPTS_SHEET = get_worksheet(SPREADSHEET, "Tanker Receipts")
 ensure_directories()
 DATABASE = load_data(DATABASE_FILE)
 
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+ASSETS_HEADER = [
+    "Fleet No",
+    "Asset ID",
+    "Category",
+    "Description",
+    "Plate Number",
+    "Benchmark_KmL",
+]
+
+DISPENSE_HEADER = [
+    "Timestamp",
+    "Date",
+    "Fleet No",
+    "Asset ID",
+    "Category",
+    "Description",
+    "Source Tanker",
+    "Fuel Out (L)",
+    "Current Meter",
+    "Meter Unit",
+]
+
+RECEIPT_HEADER = ["Timestamp", "Date", "Tanker No", "Source Station", "Fuel In (L)"]
+
+ALLOWED_CATEGORIES = ["Vehicle", "Bus", "Equipment", "Machine", "Tanker"]
+CATEGORY_ALIASES = {
+    "vehicle": "Vehicle",
+    "vehicles": "Vehicle",
+    "bus": "Bus",
+    "buses": "Bus",
+    "equipment": "Equipment",
+    "machine": "Machine",
+    "machines": "Machine",
+    "machine/equipment": "Equipment",
+    "equipment/machine": "Equipment",
+    "tanker": "Tanker",
+    "tankers": "Tanker",
+}
+DEFAULT_TANKERS = ["BPS-95", "HSC-116", "BPS-13", "HSC-101"]
+METER_HOUR_CATEGORIES = {"Equipment", "Machine", "Tanker"}
+
+
+@st.cache_resource
+def get_gs_client():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    return gspread.authorize(creds)
+
+
+@st.cache_resource
+def get_spreadsheet():
+    return get_gs_client().open_by_url(st.secrets["sheet_url"])
+
+
+def get_or_create_worksheet(spreadsheet, title: str, rows: int = 2000, cols: int = 30):
+    try:
+        return spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        return spreadsheet.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def ws_to_df(worksheet) -> pd.DataFrame:
+    records = worksheet.get_all_records()
+    return pd.DataFrame(records) if records else pd.DataFrame()
+
+
+def df_with_header(worksheet, header):
+    if not ensure_header_safe(worksheet, header, worksheet.title):
+        st.stop()
+
+    return ws_to_df(worksheet)
+
+
+def ensure_header_safe(worksheet, header, sheet_name: str) -> bool:
+    current = worksheet.row_values(1)
+
+    if not current:
+        worksheet.append_row(header, value_input_option="RAW")
+        return True
+
+    if current != header:
+        st.error(
+            f"Header mismatch in '{sheet_name}'. Please update the sheet to match the app before proceeding."
+        )
+        st.write("Expected header:", header)
+        st.write("Actual header:", current)
+        return False
+
+    return True
+
+
+def append_dict(worksheet, row_dict, header):
+    if not ensure_header_safe(worksheet, header, worksheet.title):
+        return
+
+    worksheet.append_row(
+        [row_dict.get(h, "") for h in header], value_input_option="USER_ENTERED"
+    )
+
+
+def normalize_category(category: str) -> str:
+    if pd.isna(category):
+        return ""
+
+    raw_value = str(category).strip()
+    normalized_key = raw_value.replace("&", "/").replace(" and ", "/").lower()
+    normalized_key = normalized_key.replace(" ", "")
+
+    canonical = CATEGORY_ALIASES.get(normalized_key)
+    if canonical:
+        return canonical
+
+    if raw_value.title() in ALLOWED_CATEGORIES:
+        return raw_value.title()
+
+    return raw_value
+
+
+def build_search_labels(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe
+
+    return dataframe.assign(
+        Search_Label=lambda frame: (
+            frame["Fleet No"].astype(str)
+            + " | "
+            + frame["Description"].astype(str)
+            + " ("
+            + frame["Plate Number"].astype(str)
+            + ")"
+        )
+    )
+
+
+def get_tanker_options(dataframe: pd.DataFrame):
+    tankers = dataframe[dataframe["Category"] == "Tanker"]["Fleet No"].tolist()
+
+    if tankers:
+        return tankers
+
+    return DEFAULT_TANKERS
+
+
+def get_worksheets():
+    spreadsheet = get_spreadsheet()
+    return (
+        get_or_create_worksheet(spreadsheet, "Assets"),
+        get_or_create_worksheet(spreadsheet, "Tanker Dispensing"),
+        get_or_create_worksheet(spreadsheet, "Tanker Receipts"),
+    )
+
+
+def require_secrets():
+    missing = [
+        key for key in ("gcp_service_account", "sheet_url") if key not in st.secrets
+    ]
+
+    if missing:
+        st.error(
+            "Missing Streamlit secrets: " + ", ".join(missing) + ". "
+            "Please set them in .streamlit/secrets.toml."
+        )
+        st.stop()
+
+
+require_secrets()
+ws_assets, ws_dispense, ws_receipts = get_worksheets()
+
+DATABASE = df_with_header(ws_assets, ASSETS_HEADER)
+if "Category" in DATABASE.columns:
+    DATABASE["Category"] = DATABASE["Category"].apply(normalize_category)
+
 st.sidebar.title("⛽ Fuel Command Center")
 st.sidebar.caption("Fast data entry and live analytics for tanker operations.")
 PAGE = st.sidebar.radio(
@@ -272,7 +450,8 @@ if PAGE == "📝 Log Entry":
                 st.error("Please select a Fleet Number.")
             else:
                 new_entry = {
-                    "Date": date,
+                    "Timestamp": datetime.utcnow().isoformat(),
+                    "Date": str(date),
                     "Fleet No": fleet_no,
                     "Asset ID": asset_row["Asset ID"],
                     "Category": category,
@@ -325,7 +504,8 @@ if PAGE == "📝 Log Entry":
 
         if st.button("Log Refill"):
             entry = {
-                "Date": date_in,
+                "Timestamp": datetime.utcnow().isoformat(),
+                "Date": str(date_in),
                 "Tanker No": target_tanker,
                 "Source Station": source_station,
                 "Fuel In (L)": vol_in,
