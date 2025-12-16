@@ -1,11 +1,4 @@
 [server]
 headless = true
-
-[browser]
-gatherUsageStats = false
-
-[theme]
-base = "light"
-
-[ui]
-layout = "wide"
+enableCORS = false
+enableXsrfProtection = false
