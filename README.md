@@ -4,7 +4,7 @@ This repository captures a lightweight prototype for fuel tracking across a mixe
 
 ## Current data snapshot
 
-The repository includes a sample `data/Database.csv` that mirrors 347 assets across four categories (Vehicles, Buses, Machines/Equipment, and Tankers). Use it to seed your Google Sheet’s **Assets** tab if you need a starting point. The tankers present are:
+The provided `data/Database.csv` contains 347 assets with four categories (Vehicles, Buses, Machines/Equipment, and Tankers). The tankers present are:
 
 - **HSC-101** — Plate: HA 948
 - **HSC-116** — Plate: DA 4247
@@ -63,15 +63,15 @@ These changes make Google Sheets the single source of truth while still enabling
 ## Running the Streamlit demo locally
 
 1. Install dependencies: `pip install -r requirements.txt`.
-2. Configure Streamlit secrets (e.g., `.streamlit/secrets.toml`) with:
-   - `gcp_service_account` — full JSON object for the service account.
-   - `sheet_url` — URL of the Google Sheet containing tabs **Assets**, **Tanker Dispensing**, and **Tanker Receipts** (created automatically if missing).
-3. Populate the **Assets** tab in your Google Sheet (you can import `data/Database.csv` as a starter list).
-4. Launch: `streamlit run app.py`.
-5. Use the **📝 Log Entry** tab to record dispensing (OUT) or tanker refills (IN).
-6. Review **📊 Analytics Dashboard** and **🛢️ Tanker Inventory** to validate totals.
+2. Ensure `data/Database.csv` exists (copy the sample provided in `data/` or replace it with your own export).
+3. Launch: `streamlit run app.py`.
+4. Use the **📝 Log Entry** tab to record dispensing (OUT) or tanker refills (IN).
+5. Review **📊 Analytics Dashboard** and **🛢️ Tanker Inventory** to validate totals.
 
-All reads and writes occur directly in Google Sheets—no CSV logs are persisted locally.
+Runtime files are written to the `outputs/` folder (gitignored by default):
+
+- `outputs/Fuel_Log_Vehicles.csv` — append-only log of OUT transactions.
+- `outputs/Fuel_Log_Tankers.csv` — append-only log of IN receipts.
 
 ## Switching from CSV to Google Sheets
 
