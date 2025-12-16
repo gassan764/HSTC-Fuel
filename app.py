@@ -1,8 +1,14 @@
+import logging
 from datetime import datetime
 from pathlib import Path
 
+import gspread
 import pandas as pd
 import streamlit as st
+from google.oauth2.service_account import Credentials
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 st.set_page_config(page_title="Fuel Command Center", layout="wide", page_icon="⛽")
 
@@ -30,6 +36,10 @@ CATEGORY_ALIASES = {
 }
 DEFAULT_TANKERS = ["BPS-95", "HSC-116", "BPS-13", "HSC-101"]
 METER_HOUR_CATEGORIES = {"Equipment", "Machine", "Tanker"}
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 
 def ensure_directories() -> None:
@@ -109,6 +119,62 @@ def get_tanker_options(dataframe: pd.DataFrame):
     return DEFAULT_TANKERS
 
 
+def require_google_sheet():
+    try:
+        secrets_keys = list(st.secrets.keys())
+        service_account_info = st.secrets["gcp_service_account"]
+        sheet_url = st.secrets["sheet_url"]
+    except Exception as error:
+        st.error(f"Missing Google Sheets secrets: {error}")
+        st.stop()
+
+    try:
+        credentials = Credentials.from_service_account_info(
+            service_account_info, scopes=GOOGLE_SCOPES
+        )
+        client = gspread.authorize(credentials)
+        spreadsheet = client.open_by_url(sheet_url)
+    except Exception as error:
+        st.error(f"Failed to connect to Google Sheets: {error}")
+        st.stop()
+
+    return spreadsheet, sheet_url, service_account_info, secrets_keys
+
+
+def get_worksheet(spreadsheet: gspread.Spreadsheet, worksheet_name: str) -> gspread.Worksheet:
+    try:
+        return spreadsheet.worksheet(worksheet_name)
+    except Exception as error:
+        st.error(f"Unable to access worksheet '{worksheet_name}': {error}")
+        st.stop()
+
+
+def append_row_with_logging(
+    worksheet: gspread.Worksheet,
+    row_values: list,
+    worksheet_label: str,
+    destination=st,
+):
+    destination.info(f"Appending to {worksheet_label}: {row_values}")
+    logger.info("Appending to %s: %s", worksheet_label, row_values)
+
+    try:
+        worksheet.append_row(row_values, value_input_option="USER_ENTERED")
+        last_row = worksheet.get_all_values()[-1]
+    except Exception as error:
+        st.error(f"Failed to append to {worksheet_label}: {error}")
+        st.stop()
+
+    destination.success(f"Last row in {worksheet_label}: {last_row}")
+    logger.info("Last row now: %s", last_row)
+    return last_row
+
+
+SPREADSHEET, SHEET_URL, SERVICE_ACCOUNT_INFO, SECRET_KEYS = require_google_sheet()
+TANKER_DISPENSING_SHEET = get_worksheet(SPREADSHEET, "Tanker Dispensing")
+TANKER_RECEIPTS_SHEET = get_worksheet(SPREADSHEET, "Tanker Receipts")
+
+
 ensure_directories()
 DATABASE = load_data(DATABASE_FILE)
 
@@ -117,6 +183,34 @@ st.sidebar.caption("Fast data entry and live analytics for tanker operations.")
 PAGE = st.sidebar.radio(
     "Navigate", ["📝 Log Entry", "📊 Analytics Dashboard", "🛢️ Tanker Inventory"]
 )
+
+diagnostics_panel = st.sidebar.container()
+diagnostics_panel.markdown("---")
+diagnostics_panel.subheader("Diagnostics")
+diagnostics_panel.write({"st.secrets.keys()": SECRET_KEYS})
+diagnostics_panel.write(
+    {
+        "client_email": SERVICE_ACCOUNT_INFO.get("client_email"),
+        "sheet_url": SHEET_URL,
+        "spreadsheet_title": SPREADSHEET.title,
+        "spreadsheet_id": SPREADSHEET.id,
+    }
+)
+
+if diagnostics_panel.button("Test Sheets Write"):
+    test_row = [
+        datetime.utcnow().isoformat(),
+        datetime.utcnow().date().isoformat(),
+        "TEST",
+        "TEST",
+        0.01,
+    ]
+    append_row_with_logging(
+        TANKER_RECEIPTS_SHEET,
+        test_row,
+        "Tanker Receipts",
+        destination=diagnostics_panel,
+    )
 
 if PAGE == "📝 Log Entry":
     st.title("New Fuel Transaction")
@@ -189,6 +283,22 @@ if PAGE == "📝 Log Entry":
                     "Meter Unit": meter_unit,
                 }
 
+                dispensing_row = [
+                    datetime.utcnow().isoformat(),
+                    date.isoformat(),
+                    fleet_no,
+                    asset_row["Asset ID"],
+                    category,
+                    asset_row["Description"],
+                    source_tanker,
+                    fuel_qty,
+                    current_meter,
+                    meter_unit,
+                ]
+                append_row_with_logging(
+                    TANKER_DISPENSING_SHEET, dispensing_row, "Tanker Dispensing"
+                )
+
                 log_df = load_logs(VEHICLE_LOG_FILE, list(new_entry.keys()))
                 new_df = pd.DataFrame([new_entry])
                 log_df = pd.concat([log_df, new_df], ignore_index=True)
@@ -220,6 +330,16 @@ if PAGE == "📝 Log Entry":
                 "Source Station": source_station,
                 "Fuel In (L)": vol_in,
             }
+            receipt_row = [
+                datetime.utcnow().isoformat(),
+                date_in.isoformat(),
+                target_tanker,
+                source_station,
+                vol_in,
+            ]
+            append_row_with_logging(
+                TANKER_RECEIPTS_SHEET, receipt_row, "Tanker Receipts"
+            )
             log_df = load_logs(TANKER_LOG_FILE, list(entry.keys()))
             new_df = pd.DataFrame([entry])
             log_df = pd.concat([log_df, new_df], ignore_index=True)
