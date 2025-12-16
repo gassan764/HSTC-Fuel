@@ -1,11 +1,116 @@
 from datetime import datetime
+from pathlib import Path
 
-import gspread
 import pandas as pd
 import streamlit as st
-from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Fuel Command Center", layout="wide", page_icon="⛽")
+
+BASE_DIR = Path(__file__).parent.resolve()
+DATA_DIR = BASE_DIR / "data"
+OUTPUTS_DIR = BASE_DIR / "outputs"
+
+DATABASE_FILE = DATA_DIR / "Database.csv"
+VEHICLE_LOG_FILE = OUTPUTS_DIR / "Fuel_Log_Vehicles.csv"
+TANKER_LOG_FILE = OUTPUTS_DIR / "Fuel_Log_Tankers.csv"
+
+ALLOWED_CATEGORIES = ["Vehicle", "Bus", "Equipment", "Machine", "Tanker"]
+CATEGORY_ALIASES = {
+    "vehicle": "Vehicle",
+    "vehicles": "Vehicle",
+    "bus": "Bus",
+    "buses": "Bus",
+    "equipment": "Equipment",
+    "machine": "Machine",
+    "machines": "Machine",
+    "machine/equipment": "Equipment",
+    "equipment/machine": "Equipment",
+    "tanker": "Tanker",
+    "tankers": "Tanker",
+}
+DEFAULT_TANKERS = ["BPS-95", "HSC-116", "BPS-13", "HSC-101"]
+METER_HOUR_CATEGORIES = {"Equipment", "Machine", "Tanker"}
+
+
+def ensure_directories() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def normalize_category(category: str) -> str:
+    if pd.isna(category):
+        return ""
+
+    raw_value = str(category).strip()
+    normalized_key = raw_value.replace("&", "/").replace(" and ", "/").lower()
+    normalized_key = normalized_key.replace(" ", "")
+
+    canonical = CATEGORY_ALIASES.get(normalized_key)
+    if canonical:
+        return canonical
+
+    if raw_value.title() in ALLOWED_CATEGORIES:
+        return raw_value.title()
+
+    return raw_value
+
+
+@st.cache_data
+def load_data(database_path: Path) -> pd.DataFrame:
+    if not database_path.exists():
+        st.error(
+            f"⚠️ Critical Error: '{database_path.name}' not found. "
+            "Please place the file in the data/ folder."
+        )
+        return pd.DataFrame()
+
+    dataframe = pd.read_csv(database_path)
+
+    if "Category" in dataframe.columns:
+        dataframe["Category"] = dataframe["Category"].apply(normalize_category)
+
+    return dataframe
+
+
+def load_logs(file_path: Path, columns) -> pd.DataFrame:
+    if not file_path.exists():
+        return pd.DataFrame(columns=columns)
+
+    return pd.read_csv(file_path)
+
+
+def save_log(df: pd.DataFrame, file_path: Path) -> None:
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(file_path, index=False)
+
+
+def build_search_labels(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe.empty:
+        return dataframe
+
+    return dataframe.assign(
+        Search_Label=lambda frame: (
+            frame["Fleet No"].astype(str)
+            + " | "
+            + frame["Description"].astype(str)
+            + " ("
+            + frame["Plate Number"].astype(str)
+            + ")"
+        )
+    )
+
+
+def get_tanker_options(dataframe: pd.DataFrame):
+    tankers = dataframe[dataframe["Category"] == "Tanker"]["Fleet No"].tolist()
+
+    if tankers:
+        return tankers
+
+    return DEFAULT_TANKERS
+
+
+ensure_directories()
+DATABASE = load_data(DATABASE_FILE)
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -195,7 +300,7 @@ if PAGE == "📝 Log Entry":
     st.title("New Fuel Transaction")
 
     if DATABASE.empty:
-        st.warning("Database is empty. Please check the 'Assets' tab in Google Sheets.")
+        st.warning("Database is empty. Please check data/Database.csv")
         st.stop()
 
     operation_type = st.radio(
@@ -254,16 +359,19 @@ if PAGE == "📝 Log Entry":
                     "Timestamp": datetime.utcnow().isoformat(),
                     "Date": str(date),
                     "Fleet No": fleet_no,
-                    "Asset ID": asset_row.get("Asset ID", ""),
+                    "Asset ID": asset_row["Asset ID"],
                     "Category": category,
-                    "Description": asset_row.get("Description", ""),
+                    "Description": asset_row["Description"],
                     "Source Tanker": source_tanker,
                     "Fuel Out (L)": fuel_qty,
                     "Current Meter": current_meter,
                     "Meter Unit": meter_unit,
                 }
 
-                append_dict(ws_dispense, new_entry, DISPENSE_HEADER)
+                log_df = load_logs(VEHICLE_LOG_FILE, list(new_entry.keys()))
+                new_df = pd.DataFrame([new_entry])
+                log_df = pd.concat([log_df, new_df], ignore_index=True)
+                save_log(log_df, VEHICLE_LOG_FILE)
 
                 st.toast(f"Logged {fuel_qty}L for {fleet_no}!")
                 st.success(
@@ -292,22 +400,23 @@ if PAGE == "📝 Log Entry":
                 "Source Station": source_station,
                 "Fuel In (L)": vol_in,
             }
-            append_dict(ws_receipts, entry, RECEIPT_HEADER)
+            log_df = load_logs(TANKER_LOG_FILE, list(entry.keys()))
+            new_df = pd.DataFrame([entry])
+            log_df = pd.concat([log_df, new_df], ignore_index=True)
+            save_log(log_df, TANKER_LOG_FILE)
 
             st.success(f"✅ Added {vol_in}L to {target_tanker} Inventory.")
 
 elif PAGE == "📊 Analytics Dashboard":
     st.title("Fuel Analytics")
 
-    vehicle_log = df_with_header(ws_dispense, DISPENSE_HEADER)
+    vehicle_log = load_logs(
+        VEHICLE_LOG_FILE, ["Date", "Fleet No", "Category", "Fuel Out (L)"]
+    )
 
     if vehicle_log.empty:
         st.info("No data logged yet. Go to 'Log Entry' to start.")
     else:
-        vehicle_log["Fuel Out (L)"] = pd.to_numeric(
-            vehicle_log.get("Fuel Out (L)"), errors="coerce"
-        ).fillna(0)
-
         kpi1, kpi2, kpi3 = st.columns(3)
         total_fuel = vehicle_log["Fuel Out (L)"].sum()
         total_entries = len(vehicle_log)
@@ -344,18 +453,8 @@ elif PAGE == "🛢️ Tanker Inventory":
     st.title("Tanker Balances")
     st.write("Live tracking of fuel inside your 4 mobile tankers.")
 
-    receipts_log = df_with_header(ws_receipts, RECEIPT_HEADER)
-    vehicle_log = df_with_header(ws_dispense, DISPENSE_HEADER)
-
-    if not receipts_log.empty:
-        receipts_log["Fuel In (L)"] = pd.to_numeric(
-            receipts_log.get("Fuel In (L)"), errors="coerce"
-        ).fillna(0)
-
-    if not vehicle_log.empty:
-        vehicle_log["Fuel Out (L)"] = pd.to_numeric(
-            vehicle_log.get("Fuel Out (L)"), errors="coerce"
-        ).fillna(0)
+    tanker_log = load_logs(TANKER_LOG_FILE, ["Tanker No", "Fuel In (L)"])
+    vehicle_log = load_logs(VEHICLE_LOG_FILE, ["Source Tanker", "Fuel Out (L)"])
 
     column_grid = st.columns(2)
 
@@ -363,10 +462,10 @@ elif PAGE == "🛢️ Tanker Inventory":
         total_in = 0
         total_out = 0
 
-        if not receipts_log.empty and "Tanker No" in receipts_log.columns:
-            total_in = receipts_log[receipts_log["Tanker No"] == tanker]["Fuel In (L)"].sum()
+        if not tanker_log.empty:
+            total_in = tanker_log[tanker_log["Tanker No"] == tanker]["Fuel In (L)"].sum()
 
-        if not vehicle_log.empty and "Source Tanker" in vehicle_log.columns:
+        if not vehicle_log.empty:
             total_out = (
                 vehicle_log[vehicle_log["Source Tanker"] == tanker]["Fuel Out (L)"].sum()
             )
