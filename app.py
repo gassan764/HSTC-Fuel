@@ -42,6 +42,10 @@ GOOGLE_SCOPES = [
 ]
 
 
+class MissingSecretError(Exception):
+    """Raised when required Streamlit secrets are absent."""
+
+
 def ensure_directories() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -120,23 +124,33 @@ def get_tanker_options(dataframe: pd.DataFrame):
 
 
 def require_google_sheet():
-    try:
-        secrets_keys = list(st.secrets.keys())
-        service_account_info = st.secrets["gcp_service_account"]
-        sheet_url = st.secrets["sheet_url"]
-    except Exception as error:
-        st.error(f"Missing Google Sheets secrets: {error}")
-        st.stop()
+    """
+    Validate and return Google Sheets client resources.
 
-    try:
-        credentials = Credentials.from_service_account_info(
-            service_account_info, scopes=GOOGLE_SCOPES
+    Important: call this only after the page has begun rendering to avoid
+    accessing st.secrets at module import time. Streamlit Cloud mounts secrets
+    at runtime, so early access can prevent the UI from rendering diagnostics.
+    """
+
+    secrets_keys = list(st.secrets.keys())
+    sheet_url = st.secrets.get("sheet_url")
+    service_account_info = st.secrets.get("gcp_service_account")
+
+    if not sheet_url:
+        raise MissingSecretError(
+            f"Missing 'sheet_url' secret. Visible keys: {secrets_keys}"
         )
-        client = gspread.authorize(credentials)
-        spreadsheet = client.open_by_url(sheet_url)
-    except Exception as error:
-        st.error(f"Failed to connect to Google Sheets: {error}")
-        st.stop()
+
+    if not service_account_info:
+        raise MissingSecretError(
+            f"Missing 'gcp_service_account' secret. Visible keys: {secrets_keys}"
+        )
+
+    credentials = Credentials.from_service_account_info(
+        service_account_info, scopes=GOOGLE_SCOPES
+    )
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_url(sheet_url)
 
     return spreadsheet, sheet_url, service_account_info, secrets_keys
 
@@ -170,254 +184,286 @@ def append_row_with_logging(
     return last_row
 
 
-SPREADSHEET, SHEET_URL, SERVICE_ACCOUNT_INFO, SECRET_KEYS = require_google_sheet()
-TANKER_DISPENSING_SHEET = get_worksheet(SPREADSHEET, "Tanker Dispensing")
-TANKER_RECEIPTS_SHEET = get_worksheet(SPREADSHEET, "Tanker Receipts")
+def render_boot_diagnostics():
+    """Display secrets visibility before any fail-fast checks."""
 
-
-ensure_directories()
-DATABASE = load_data(DATABASE_FILE)
-
-st.sidebar.title("⛽ Fuel Command Center")
-st.sidebar.caption("Fast data entry and live analytics for tanker operations.")
-PAGE = st.sidebar.radio(
-    "Navigate", ["📝 Log Entry", "📊 Analytics Dashboard", "🛢️ Tanker Inventory"]
-)
-
-diagnostics_panel = st.sidebar.container()
-diagnostics_panel.markdown("---")
-diagnostics_panel.subheader("Diagnostics")
-diagnostics_panel.write({"st.secrets.keys()": SECRET_KEYS})
-diagnostics_panel.write(
-    {
-        "client_email": SERVICE_ACCOUNT_INFO.get("client_email"),
-        "sheet_url": SHEET_URL,
-        "spreadsheet_title": SPREADSHEET.title,
-        "spreadsheet_id": SPREADSHEET.id,
-    }
-)
-
-if diagnostics_panel.button("Test Sheets Write"):
-    test_row = [
-        datetime.utcnow().isoformat(),
-        datetime.utcnow().date().isoformat(),
-        "TEST",
-        "TEST",
-        0.01,
-    ]
-    append_row_with_logging(
-        TANKER_RECEIPTS_SHEET,
-        test_row,
-        "Tanker Receipts",
-        destination=diagnostics_panel,
+    boot_panel = st.sidebar.container()
+    boot_panel.subheader("Boot Diagnostics")
+    visible_keys = list(st.secrets.keys())
+    boot_panel.write(
+        {
+            "visible_keys": visible_keys,
+            "has_sheet_url": "sheet_url" in st.secrets,
+            "has_gcp_service_account": "gcp_service_account" in st.secrets,
+        }
     )
 
-if PAGE == "📝 Log Entry":
-    st.title("New Fuel Transaction")
+    return visible_keys
 
-    if DATABASE.empty:
-        st.warning("Database is empty. Please check data/Database.csv")
+
+def main():
+    ensure_directories()
+
+    render_boot_diagnostics()
+
+    try:
+        spreadsheet, sheet_url, service_account_info, secret_keys = require_google_sheet()
+        tanker_dispensing_sheet = get_worksheet(spreadsheet, "Tanker Dispensing")
+        tanker_receipts_sheet = get_worksheet(spreadsheet, "Tanker Receipts")
+    except MissingSecretError as error:
+        st.error(error)
+        st.stop()
+    except Exception as error:
+        st.error(f"Failed to connect to Google Sheets: {error}")
         st.stop()
 
-    operation_type = st.radio(
-        "Select Operation:", ["Dispense to Fleet (OUT)", "Refill Tanker (IN)"], horizontal=True
+    database = load_data(DATABASE_FILE)
+
+    st.sidebar.title("⛽ Fuel Command Center")
+    st.sidebar.caption("Fast data entry and live analytics for tanker operations.")
+    page = st.sidebar.radio(
+        "Navigate", ["📝 Log Entry", "📊 Analytics Dashboard", "🛢️ Tanker Inventory"]
     )
 
-    if operation_type == "Dispense to Fleet (OUT)":
-        st.info("Log fuel dispensing from a Tanker to a Vehicle/Equipment.")
-
-        column_left, column_right = st.columns(2)
-
-        with column_left:
-            searchable_db = build_search_labels(DATABASE)
-            search_options = [""] + list(searchable_db["Search_Label"].unique())
-            selected_label = st.selectbox(
-                "🔍 Search Fleet No (Type to Search):",
-                options=search_options,
-            )
-
-            fleet_no = None
-            category = None
-            asset_row = None
-
-            if selected_label:
-                asset_row = searchable_db[searchable_db["Search_Label"] == selected_label].iloc[0]
-
-                st.success(f"**Selected:** {asset_row['Description']}")
-
-                detail_column_1, detail_column_2 = st.columns(2)
-                detail_column_1.write(f"**Category:** {asset_row['Category']}")
-                detail_column_2.write(f"**Plate:** {asset_row['Plate Number']}")
-
-                fleet_no = asset_row["Fleet No"]
-                category = asset_row["Category"]
-
-        with column_right:
-            tanker_options = get_tanker_options(DATABASE)
-            source_tanker = st.selectbox("⛽ Source Tanker (Dispenser):", options=tanker_options)
-
-            date = st.date_input("Date", datetime.today())
-            fuel_qty = st.number_input("Fuel Dispensed (Liters)", min_value=1.0, step=1.0)
-
-            meter_unit = "Km"
-            if category and category in METER_HOUR_CATEGORIES:
-                meter_unit = "Hours"
-
-            current_meter = st.number_input(
-                f"Current Odometer/Hour Meter ({meter_unit})", min_value=0.0, step=1.0
-            )
-
-        if st.button("Submit Entry", type="primary"):
-            if not fleet_no or asset_row is None:
-                st.error("Please select a Fleet Number.")
-            else:
-                new_entry = {
-                    "Date": date,
-                    "Fleet No": fleet_no,
-                    "Asset ID": asset_row["Asset ID"],
-                    "Category": category,
-                    "Description": asset_row["Description"],
-                    "Source Tanker": source_tanker,
-                    "Fuel Out (L)": fuel_qty,
-                    "Current Meter": current_meter,
-                    "Meter Unit": meter_unit,
-                }
-
-                dispensing_row = [
-                    datetime.utcnow().isoformat(),
-                    date.isoformat(),
-                    fleet_no,
-                    asset_row["Asset ID"],
-                    category,
-                    asset_row["Description"],
-                    source_tanker,
-                    fuel_qty,
-                    current_meter,
-                    meter_unit,
-                ]
-                append_row_with_logging(
-                    TANKER_DISPENSING_SHEET, dispensing_row, "Tanker Dispensing"
-                )
-
-                log_df = load_logs(VEHICLE_LOG_FILE, list(new_entry.keys()))
-                new_df = pd.DataFrame([new_entry])
-                log_df = pd.concat([log_df, new_df], ignore_index=True)
-                save_log(log_df, VEHICLE_LOG_FILE)
-
-                st.toast(f"Logged {fuel_qty}L for {fleet_no}!")
-                st.success(
-                    f"✅ Transaction Saved. {fleet_no} took {fuel_qty}L from {source_tanker}."
-                )
-
-    elif operation_type == "Refill Tanker (IN)":
-        st.warning("Log fuel COMING IN to your Tankers from External Stations.")
-
-        column_left, column_right = st.columns(2)
-        with column_left:
-            tanker_options = get_tanker_options(DATABASE)
-            target_tanker = st.selectbox("Select Tanker Receiving Fuel:", options=tanker_options)
-
-        with column_right:
-            source_station = st.text_input("External Station Name (e.g., Shell Haima):")
-
-        vol_in = st.number_input("Volume Received (Liters):", min_value=1)
-        date_in = st.date_input("Date", datetime.today())
-
-        if st.button("Log Refill"):
-            entry = {
-                "Date": date_in,
-                "Tanker No": target_tanker,
-                "Source Station": source_station,
-                "Fuel In (L)": vol_in,
-            }
-            receipt_row = [
-                datetime.utcnow().isoformat(),
-                date_in.isoformat(),
-                target_tanker,
-                source_station,
-                vol_in,
-            ]
-            append_row_with_logging(
-                TANKER_RECEIPTS_SHEET, receipt_row, "Tanker Receipts"
-            )
-            log_df = load_logs(TANKER_LOG_FILE, list(entry.keys()))
-            new_df = pd.DataFrame([entry])
-            log_df = pd.concat([log_df, new_df], ignore_index=True)
-            save_log(log_df, TANKER_LOG_FILE)
-
-            st.success(f"✅ Added {vol_in}L to {target_tanker} Inventory.")
-
-elif PAGE == "📊 Analytics Dashboard":
-    st.title("Fuel Analytics")
-
-    vehicle_log = load_logs(
-        VEHICLE_LOG_FILE, ["Date", "Fleet No", "Category", "Fuel Out (L)"]
+    diagnostics_panel = st.sidebar.container()
+    diagnostics_panel.markdown("---")
+    diagnostics_panel.subheader("Diagnostics")
+    diagnostics_panel.write({"st.secrets.keys()": secret_keys})
+    diagnostics_panel.write(
+        {
+            "client_email": service_account_info.get("client_email"),
+            "sheet_url": sheet_url,
+            "spreadsheet_title": spreadsheet.title,
+            "spreadsheet_id": spreadsheet.id,
+        }
     )
 
-    if vehicle_log.empty:
-        st.info("No data logged yet. Go to 'Log Entry' to start.")
-    else:
-        kpi1, kpi2, kpi3 = st.columns(3)
-        total_fuel = vehicle_log["Fuel Out (L)"].sum()
-        total_entries = len(vehicle_log)
-
-        kpi1.metric("Total Fuel Consumed", f"{total_fuel:,.0f} L")
-        kpi2.metric("Total Transactions", total_entries)
-        kpi3.metric("Active Assets", vehicle_log["Fleet No"].nunique())
-
-        st.markdown("---")
-
-        chart_column_1, chart_column_2 = st.columns(2)
-
-        with chart_column_1:
-            st.subheader("Consumption by Category")
-            chart_data = vehicle_log.groupby("Category")["Fuel Out (L)"].sum()
-            st.bar_chart(chart_data)
-
-        with chart_column_2:
-            st.subheader("Top Consumers (Vehicles)")
-            top_consumers = (
-                vehicle_log.groupby("Fleet No")["Fuel Out (L)"]
-                .sum()
-                .sort_values(ascending=False)
-                .head(5)
-            )
-            st.bar_chart(top_consumers)
-
-        st.subheader("Recent Transactions")
-        st.dataframe(
-            vehicle_log.sort_index(ascending=False).head(10), use_container_width=True
+    if diagnostics_panel.button("Test Sheets Write"):
+        test_row = [
+            datetime.utcnow().isoformat(),
+            datetime.utcnow().date().isoformat(),
+            "TEST",
+            "TEST",
+            0.01,
+        ]
+        append_row_with_logging(
+            tanker_receipts_sheet,
+            test_row,
+            "Tanker Receipts",
+            destination=diagnostics_panel,
         )
 
-elif PAGE == "🛢️ Tanker Inventory":
-    st.title("Tanker Balances")
-    st.write("Live tracking of fuel inside your 4 mobile tankers.")
+    if page == "📝 Log Entry":
+        st.title("New Fuel Transaction")
 
-    tanker_log = load_logs(TANKER_LOG_FILE, ["Tanker No", "Fuel In (L)"])
-    vehicle_log = load_logs(VEHICLE_LOG_FILE, ["Source Tanker", "Fuel Out (L)"])
+        if database.empty:
+            st.warning("Database is empty. Please check data/Database.csv")
+            st.stop()
 
-    column_grid = st.columns(2)
+        operation_type = st.radio(
+            "Select Operation:", ["Dispense to Fleet (OUT)", "Refill Tanker (IN)"], horizontal=True
+        )
 
-    for index, tanker in enumerate(DEFAULT_TANKERS):
-        total_in = 0
-        total_out = 0
+        if operation_type == "Dispense to Fleet (OUT)":
+            st.info("Log fuel dispensing from a Tanker to a Vehicle/Equipment.")
 
-        if not tanker_log.empty:
-            total_in = tanker_log[tanker_log["Tanker No"] == tanker]["Fuel In (L)"].sum()
+            column_left, column_right = st.columns(2)
 
-        if not vehicle_log.empty:
-            total_out = (
-                vehicle_log[vehicle_log["Source Tanker"] == tanker]["Fuel Out (L)"].sum()
+            with column_left:
+                searchable_db = build_search_labels(database)
+                search_options = [""] + list(searchable_db["Search_Label"].unique())
+                selected_label = st.selectbox(
+                    "🔍 Search Fleet No (Type to Search):",
+                    options=search_options,
+                )
+
+                fleet_no = None
+                category = None
+                asset_row = None
+
+                if selected_label:
+                    asset_row = searchable_db[searchable_db["Search_Label"] == selected_label].iloc[0]
+
+                    st.success(f"**Selected:** {asset_row['Description']}")
+
+                    detail_column_1, detail_column_2 = st.columns(2)
+                    detail_column_1.write(f"**Category:** {asset_row['Category']}")
+                    detail_column_2.write(f"**Plate:** {asset_row['Plate Number']}")
+
+                    fleet_no = asset_row["Fleet No"]
+                    category = asset_row["Category"]
+
+            with column_right:
+                tanker_options = get_tanker_options(database)
+                source_tanker = st.selectbox("⛽ Source Tanker (Dispenser):", options=tanker_options)
+
+                date = st.date_input("Date", datetime.today())
+
+                fuel_qty = st.number_input("Fuel Dispensed (Liters)", min_value=1.0, step=1.0)
+
+                meter_unit = "Km"
+                if category and category in METER_HOUR_CATEGORIES:
+                    meter_unit = "Hours"
+
+                current_meter = st.number_input(
+                    f"Current Odometer/Hour Meter ({meter_unit})", min_value=0.0, step=1.0
+                )
+
+            if st.button("Submit Entry", type="primary"):
+                if not fleet_no or asset_row is None:
+                    st.error("Please select a Fleet Number.")
+                else:
+                    new_entry = {
+                        "Date": date,
+                        "Fleet No": fleet_no,
+                        "Asset ID": asset_row["Asset ID"],
+                        "Category": category,
+                        "Description": asset_row["Description"],
+                        "Source Tanker": source_tanker,
+                        "Fuel Out (L)": fuel_qty,
+                        "Current Meter": current_meter,
+                        "Meter Unit": meter_unit,
+                    }
+
+                    dispensing_row = [
+                        datetime.utcnow().isoformat(),
+                        date.isoformat(),
+                        fleet_no,
+                        asset_row["Asset ID"],
+                        category,
+                        asset_row["Description"],
+                        source_tanker,
+                        fuel_qty,
+                        current_meter,
+                        meter_unit,
+                    ]
+                    append_row_with_logging(
+                        tanker_dispensing_sheet, dispensing_row, "Tanker Dispensing"
+                    )
+
+                    log_df = load_logs(VEHICLE_LOG_FILE, list(new_entry.keys()))
+                    new_df = pd.DataFrame([new_entry])
+                    log_df = pd.concat([log_df, new_df], ignore_index=True)
+                    save_log(log_df, VEHICLE_LOG_FILE)
+
+                    st.toast(f"Logged {fuel_qty}L for {fleet_no}!")
+                    st.success(
+                        f"✅ Transaction Saved. {fleet_no} took {fuel_qty}L from {source_tanker}."
+                    )
+
+        elif operation_type == "Refill Tanker (IN)":
+            st.warning("Log fuel COMING IN to your Tankers from External Stations.")
+
+            column_left, column_right = st.columns(2)
+            with column_left:
+                tanker_options = get_tanker_options(database)
+                target_tanker = st.selectbox("Select Tanker Receiving Fuel:", options=tanker_options)
+
+            with column_right:
+                source_station = st.text_input("External Station Name (e.g., Shell Haima):")
+
+            vol_in = st.number_input("Volume Received (Liters):", min_value=1)
+            date_in = st.date_input("Date", datetime.today())
+
+            if st.button("Log Refill"):
+                entry = {
+                    "Date": date_in,
+                    "Tanker No": target_tanker,
+                    "Source Station": source_station,
+                    "Fuel In (L)": vol_in,
+                }
+                receipt_row = [
+                    datetime.utcnow().isoformat(),
+                    date_in.isoformat(),
+                    target_tanker,
+                    source_station,
+                    vol_in,
+                ]
+                append_row_with_logging(
+                    tanker_receipts_sheet, receipt_row, "Tanker Receipts"
+                )
+                log_df = load_logs(TANKER_LOG_FILE, list(entry.keys()))
+                new_df = pd.DataFrame([entry])
+                log_df = pd.concat([log_df, new_df], ignore_index=True)
+                save_log(log_df, TANKER_LOG_FILE)
+
+                st.success(f"✅ Added {vol_in}L to {target_tanker} Inventory.")
+
+    elif page == "📊 Analytics Dashboard":
+        st.title("Fuel Analytics")
+
+        vehicle_log = load_logs(
+            VEHICLE_LOG_FILE, ["Date", "Fleet No", "Category", "Fuel Out (L)"]
+        )
+
+        if vehicle_log.empty:
+            st.info("No data logged yet. Go to 'Log Entry' to start.")
+        else:
+            kpi1, kpi2, kpi3 = st.columns(3)
+            total_fuel = vehicle_log["Fuel Out (L)"].sum()
+            total_entries = len(vehicle_log)
+
+            kpi1.metric("Total Fuel Consumed", f"{total_fuel:,.0f} L")
+            kpi2.metric("Total Transactions", total_entries)
+            kpi3.metric("Active Assets", vehicle_log["Fleet No"].nunique())
+
+            st.markdown("---")
+
+            chart_column_1, chart_column_2 = st.columns(2)
+
+            with chart_column_1:
+                st.subheader("Consumption by Category")
+                chart_data = vehicle_log.groupby("Category")["Fuel Out (L)"].sum()
+                st.bar_chart(chart_data)
+
+            with chart_column_2:
+                st.subheader("Top Consumers (Vehicles)")
+                top_consumers = (
+                    vehicle_log.groupby("Fleet No")["Fuel Out (L)"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .head(5)
+                )
+                st.bar_chart(top_consumers)
+
+            st.subheader("Recent Transactions")
+            st.dataframe(
+                vehicle_log.sort_index(ascending=False).head(10), use_container_width=True
             )
 
-        current_balance = total_in - total_out
+    elif page == "🛢️ Tanker Inventory":
+        st.title("Tanker Balances")
+        st.write("Live tracking of fuel inside your 4 mobile tankers.")
 
-        with column_grid[index % 2]:
-            st.container(border=True)
-            st.subheader(f"🚛 {tanker}")
-            st.metric("Current Level", f"{current_balance:,.0f} L")
+        tanker_log = load_logs(TANKER_LOG_FILE, ["Tanker No", "Fuel In (L)"])
+        vehicle_log = load_logs(VEHICLE_LOG_FILE, ["Source Tanker", "Fuel Out (L)"])
 
-            capacity = 30000
-            percent = max(0.0, min(1.0, current_balance / capacity))
-            st.progress(percent)
-            st.caption(f"IN: {total_in} L | OUT: {total_out} L")
+        column_grid = st.columns(2)
+
+        for index, tanker in enumerate(DEFAULT_TANKERS):
+            total_in = 0
+            total_out = 0
+
+            if not tanker_log.empty:
+                total_in = tanker_log[tanker_log["Tanker No"] == tanker]["Fuel In (L)"].sum()
+
+            if not vehicle_log.empty:
+                total_out = (
+                    vehicle_log[vehicle_log["Source Tanker"] == tanker]["Fuel Out (L)"].sum()
+                )
+
+            current_balance = total_in - total_out
+
+            with column_grid[index % 2]:
+                st.container(border=True)
+                st.subheader(f"🚛 {tanker}")
+                st.metric("Current Level", f"{current_balance:,.0f} L")
+
+                capacity = 30000
+                percent = max(0.0, min(1.0, current_balance / capacity))
+                st.progress(percent)
+                st.caption(f"IN: {total_in} L | OUT: {total_out} L")
+
+
+if __name__ == "__main__":
+    main()
