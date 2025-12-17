@@ -137,6 +137,31 @@ def get_tanker_options(dataframe: pd.DataFrame):
     return DEFAULT_TANKERS
 
 
+def _serialize_service_account(service_account_info) -> str:
+    """Return a stable JSON string for caching client resources."""
+
+    try:
+        service_account_dict = dict(service_account_info)
+    except TypeError:
+        service_account_dict = service_account_info
+
+    return json.dumps(service_account_dict, sort_keys=True)
+
+
+@st.cache_resource
+def get_gspread_client(service_account_json: str) -> gspread.Client:
+    credentials = Credentials.from_service_account_info(
+        json.loads(service_account_json), scopes=GOOGLE_SCOPES
+    )
+    return gspread.authorize(credentials)
+
+
+@st.cache_resource
+def open_spreadsheet(sheet_url: str, service_account_json: str) -> gspread.Spreadsheet:
+    client = get_gspread_client(service_account_json)
+    return client.open_by_url(sheet_url)
+
+
 def require_google_sheet():
     """
     Validate and return Google Sheets client resources.
@@ -160,13 +185,10 @@ def require_google_sheet():
             f"Missing 'gcp_service_account' secret. Visible keys: {secrets_keys}"
         )
 
-    credentials = Credentials.from_service_account_info(
-        service_account_info, scopes=GOOGLE_SCOPES
-    )
-    client = gspread.authorize(credentials)
-    spreadsheet = client.open_by_url(sheet_url)
+    service_account_json = _serialize_service_account(service_account_info)
+    spreadsheet = open_spreadsheet(sheet_url, service_account_json)
 
-    return spreadsheet, sheet_url, service_account_info, secrets_keys
+    return spreadsheet, sheet_url, service_account_json, secrets_keys
 
 
 def get_worksheet(spreadsheet: gspread.Spreadsheet, worksheet_name: str) -> gspread.Worksheet:
@@ -177,23 +199,20 @@ def get_worksheet(spreadsheet: gspread.Spreadsheet, worksheet_name: str) -> gspr
         st.stop()
 
 
+HEADERS_BY_WORKSHEET = {
+    "Tanker Dispensing": DISPENSING_HEADERS,
+    "Tanker Receipts": RECEIPT_HEADERS,
+}
+
+
 @st.cache_data(ttl=120)
-def fetch_worksheet_dataframe(
+def load_worksheet_dataframe(
     sheet_url: str,
-    service_account_json: str,
     worksheet_name: str,
-    expected_headers: list[str],
+    service_account_json: str,
 ):
     try:
-        credentials = Credentials.from_service_account_info(
-            json.loads(service_account_json), scopes=GOOGLE_SCOPES
-        )
-    except Exception as error:
-        raise RuntimeError(f"Failed to build credentials: {error}")
-
-    try:
-        client = gspread.authorize(credentials)
-        spreadsheet = client.open_by_url(sheet_url)
+        spreadsheet = open_spreadsheet(sheet_url, service_account_json)
     except Exception as error:
         raise RuntimeError(f"Unable to open spreadsheet: {error}")
 
@@ -214,11 +233,13 @@ def fetch_worksheet_dataframe(
         raise RuntimeError(f"Failed to read worksheet '{worksheet_name}': {error}")
 
     if not values:
+        expected_headers = HEADERS_BY_WORKSHEET.get(worksheet_name, [])
         raise ValueError(
             f"Worksheet '{worksheet_name}' returned no data. Expected headers: {expected_headers}"
         )
 
     headers = values[0]
+    expected_headers = HEADERS_BY_WORKSHEET.get(worksheet_name, headers)
     if headers != expected_headers:
         raise ValueError(
             f"Header mismatch for '{worksheet_name}'. Expected {expected_headers} but found {headers}"
@@ -230,19 +251,13 @@ def fetch_worksheet_dataframe(
     return pd.DataFrame(values[1:], columns=headers)
 
 
-def load_worksheet_dataframe(
+def safe_load_worksheet_dataframe(
     sheet_url: str,
-    service_account_info: dict,
     worksheet_name: str,
-    expected_headers: list[str],
+    service_account_json: str,
 ):
     try:
-        return fetch_worksheet_dataframe(
-            sheet_url,
-            json.dumps(service_account_info, sort_keys=True),
-            worksheet_name,
-            expected_headers,
-        )
+        return load_worksheet_dataframe(sheet_url, worksheet_name, service_account_json)
     except KeyError as error:
         st.error(str(error))
         st.stop()
@@ -298,7 +313,7 @@ def main():
     render_boot_diagnostics()
 
     try:
-        spreadsheet, sheet_url, service_account_info, secret_keys = require_google_sheet()
+        spreadsheet, sheet_url, service_account_json, secret_keys = require_google_sheet()
         tanker_dispensing_sheet = get_worksheet(spreadsheet, "Tanker Dispensing")
         tanker_receipts_sheet = get_worksheet(spreadsheet, "Tanker Receipts")
     except MissingSecretError as error:
@@ -322,7 +337,7 @@ def main():
     diagnostics_panel.write({"st.secrets.keys()": secret_keys})
     diagnostics_panel.write(
         {
-            "client_email": service_account_info.get("client_email"),
+            "client_email": json.loads(service_account_json).get("client_email"),
             "sheet_url": sheet_url,
             "spreadsheet_title": spreadsheet.title,
             "spreadsheet_id": spreadsheet.id,
@@ -485,13 +500,14 @@ def main():
 
         if st.button("🔄 Refresh data", type="secondary"):
             st.cache_data.clear()
+            st.cache_resource.clear()
             st.rerun()
 
-        tanker_dispensing_df = load_worksheet_dataframe(
-            sheet_url, service_account_info, "Tanker Dispensing", DISPENSING_HEADERS
+        tanker_dispensing_df = safe_load_worksheet_dataframe(
+            sheet_url, "Tanker Dispensing", service_account_json
         )
-        tanker_receipts_df = load_worksheet_dataframe(
-            sheet_url, service_account_info, "Tanker Receipts", RECEIPT_HEADERS
+        tanker_receipts_df = safe_load_worksheet_dataframe(
+            sheet_url, "Tanker Receipts", service_account_json
         )
 
         tanker_dispensing_df["Date"] = pd.to_datetime(
@@ -592,13 +608,14 @@ def main():
 
         if st.button("🔄 Refresh data", type="secondary"):
             st.cache_data.clear()
+            st.cache_resource.clear()
             st.rerun()
 
-        tanker_dispensing_df = load_worksheet_dataframe(
-            sheet_url, service_account_info, "Tanker Dispensing", DISPENSING_HEADERS
+        tanker_dispensing_df = safe_load_worksheet_dataframe(
+            sheet_url, "Tanker Dispensing", service_account_json
         )
-        tanker_receipts_df = load_worksheet_dataframe(
-            sheet_url, service_account_info, "Tanker Receipts", RECEIPT_HEADERS
+        tanker_receipts_df = safe_load_worksheet_dataframe(
+            sheet_url, "Tanker Receipts", service_account_json
         )
 
         tanker_dispensing_df["Date"] = pd.to_datetime(
