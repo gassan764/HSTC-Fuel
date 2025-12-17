@@ -137,6 +137,20 @@ def get_tanker_options(dataframe: pd.DataFrame):
     return DEFAULT_TANKERS
 
 
+@st.cache_resource
+def get_gspread_client(service_account_info: dict) -> gspread.Client:
+    credentials = Credentials.from_service_account_info(
+        service_account_info, scopes=GOOGLE_SCOPES
+    )
+    return gspread.authorize(credentials)
+
+
+@st.cache_resource
+def get_spreadsheet(sheet_url: str, service_account_info: dict) -> gspread.Spreadsheet:
+    client = get_gspread_client(service_account_info)
+    return client.open_by_url(sheet_url)
+
+
 def require_google_sheet():
     """
     Validate and return Google Sheets client resources.
@@ -160,13 +174,12 @@ def require_google_sheet():
             f"Missing 'gcp_service_account' secret. Visible keys: {secrets_keys}"
         )
 
-    credentials = Credentials.from_service_account_info(
-        service_account_info, scopes=GOOGLE_SCOPES
-    )
-    client = gspread.authorize(credentials)
-    spreadsheet = client.open_by_url(sheet_url)
+    # Normalize to a plain dict and stable JSON for caching keys
+    normalized_service_account = json.loads(json.dumps(service_account_info))
+    spreadsheet = get_spreadsheet(sheet_url, normalized_service_account)
+    service_account_json = json.dumps(normalized_service_account, sort_keys=True)
 
-    return spreadsheet, sheet_url, service_account_info, secrets_keys
+    return spreadsheet, sheet_url, normalized_service_account, service_account_json, secrets_keys
 
 
 def get_worksheet(spreadsheet: gspread.Spreadsheet, worksheet_name: str) -> gspread.Worksheet:
@@ -298,7 +311,13 @@ def main():
     render_boot_diagnostics()
 
     try:
-        spreadsheet, sheet_url, service_account_info, secret_keys = require_google_sheet()
+        (
+            spreadsheet,
+            sheet_url,
+            service_account_info,
+            service_account_json,
+            secret_keys,
+        ) = require_google_sheet()
         tanker_dispensing_sheet = get_worksheet(spreadsheet, "Tanker Dispensing")
         tanker_receipts_sheet = get_worksheet(spreadsheet, "Tanker Receipts")
     except MissingSecretError as error:
