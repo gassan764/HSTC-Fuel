@@ -193,17 +193,20 @@ def get_worksheet(spreadsheet: gspread.Spreadsheet, worksheet_name: str) -> gspr
 @st.cache_data(ttl=120)
 def fetch_worksheet_dataframe(
     sheet_url: str,
+    service_account_json: str,
     worksheet_name: str,
     expected_headers: list[str],
-    service_account_json: str,
 ):
     try:
-        service_account_info = json.loads(service_account_json)
+        credentials = Credentials.from_service_account_info(
+            json.loads(service_account_json), scopes=GOOGLE_SCOPES
+        )
     except Exception as error:
-        raise RuntimeError(f"Failed to decode service account JSON: {error}")
+        raise RuntimeError(f"Failed to build credentials: {error}")
 
     try:
-        spreadsheet = get_spreadsheet(sheet_url, service_account_info)
+        client = gspread.authorize(credentials)
+        spreadsheet = client.open_by_url(sheet_url)
     except Exception as error:
         raise RuntimeError(f"Unable to open spreadsheet: {error}")
 
@@ -242,16 +245,16 @@ def fetch_worksheet_dataframe(
 
 def load_worksheet_dataframe(
     sheet_url: str,
+    service_account_info: dict,
     worksheet_name: str,
     expected_headers: list[str],
-    service_account_json: str,
 ):
     try:
         return fetch_worksheet_dataframe(
             sheet_url,
+            json.dumps(service_account_info, sort_keys=True),
             worksheet_name,
             expected_headers,
-            service_account_json,
         )
     except KeyError as error:
         st.error(str(error))
@@ -501,20 +504,13 @@ def main():
 
         if st.button("🔄 Refresh data", type="secondary"):
             st.cache_data.clear()
-            st.cache_resource.clear()
             st.rerun()
 
         tanker_dispensing_df = load_worksheet_dataframe(
-            sheet_url,
-            "Tanker Dispensing",
-            DISPENSING_HEADERS,
-            service_account_json,
+            sheet_url, service_account_info, "Tanker Dispensing", DISPENSING_HEADERS
         )
         tanker_receipts_df = load_worksheet_dataframe(
-            sheet_url,
-            "Tanker Receipts",
-            RECEIPT_HEADERS,
-            service_account_json,
+            sheet_url, service_account_info, "Tanker Receipts", RECEIPT_HEADERS
         )
 
         tanker_dispensing_df["Date"] = pd.to_datetime(
@@ -615,20 +611,13 @@ def main():
 
         if st.button("🔄 Refresh data", type="secondary"):
             st.cache_data.clear()
-            st.cache_resource.clear()
             st.rerun()
 
         tanker_dispensing_df = load_worksheet_dataframe(
-            sheet_url,
-            "Tanker Dispensing",
-            DISPENSING_HEADERS,
-            service_account_json,
+            sheet_url, service_account_info, "Tanker Dispensing", DISPENSING_HEADERS
         )
         tanker_receipts_df = load_worksheet_dataframe(
-            sheet_url,
-            "Tanker Receipts",
-            RECEIPT_HEADERS,
-            service_account_json,
+            sheet_url, service_account_info, "Tanker Receipts", RECEIPT_HEADERS
         )
 
         tanker_dispensing_df["Date"] = pd.to_datetime(
