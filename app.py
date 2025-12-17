@@ -4,6 +4,7 @@ from datetime import datetime
 from pathlib import Path
 
 import gspread
+import numpy as np
 import pandas as pd
 import streamlit as st
 from google.oauth2.service_account import Credentials
@@ -41,6 +42,14 @@ GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+ASSETS_HEADERS = [
+    "Fleet No",
+    "Asset ID",
+    "Category",
+    "Description",
+    "Plate Number",
+    "Benchmark_KmL",
+]
 DISPENSING_HEADERS = [
     "Timestamp",
     "Date",
@@ -54,6 +63,17 @@ DISPENSING_HEADERS = [
     "Meter Unit",
 ]
 RECEIPT_HEADERS = ["Timestamp", "Date", "Tanker No", "Source Station", "Fuel In (L)"]
+
+DEFAULT_DATE_RANGE_DAYS = 30
+DATA_QUALITY_LIMITS = {
+    "max_km_delta": 1500,
+    "max_hour_delta": 100,
+    "max_fuel_out": 800,
+    "min_km_per_l": 1,
+    "max_km_per_l": 25,
+    "min_efficiency_ratio": 0.75,
+    "max_efficiency_ratio": 1.25,
+}
 
 
 class MissingSecretError(Exception):
@@ -200,6 +220,7 @@ def get_worksheet(spreadsheet: gspread.Spreadsheet, worksheet_name: str) -> gspr
 
 
 HEADERS_BY_WORKSHEET = {
+    "Assets": ASSETS_HEADERS,
     "Tanker Dispensing": DISPENSING_HEADERS,
     "Tanker Receipts": RECEIPT_HEADERS,
 }
@@ -238,11 +259,16 @@ def load_worksheet_dataframe(
             f"Worksheet '{worksheet_name}' returned no data. Expected headers: {expected_headers}"
         )
 
-    headers = values[0]
-    expected_headers = HEADERS_BY_WORKSHEET.get(worksheet_name, headers)
-    if headers != expected_headers:
+    headers = [header.strip() for header in values[0]]
+    required_headers = HEADERS_BY_WORKSHEET.get(worksheet_name, headers)
+    missing_headers = [header for header in required_headers if header not in headers]
+
+    if missing_headers:
         raise ValueError(
-            f"Header mismatch for '{worksheet_name}'. Expected {expected_headers} but found {headers}"
+            "Header mismatch for '{worksheet}'. Missing required columns: {missing}. "
+            "Found columns: {found}".format(
+                worksheet=worksheet_name, missing=missing_headers, found=headers
+            )
         )
 
     if len(values) <= 1:
@@ -267,6 +293,166 @@ def safe_load_worksheet_dataframe(
     except Exception as error:
         st.error(f"Unable to load '{worksheet_name}': {error}")
         st.stop()
+
+
+def normalize_headers(dataframe: pd.DataFrame) -> pd.DataFrame:
+    if dataframe is None:
+        return pd.DataFrame()
+
+    normalized = dataframe.copy()
+    normalized.columns = [str(column).strip() for column in normalized.columns]
+    return normalized
+
+
+def ensure_string_columns(dataframe: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    updated = dataframe.copy()
+    for column in columns:
+        if column in updated.columns:
+            updated[column] = updated[column].astype(str).str.strip()
+    return updated
+
+
+def parse_event_datetime(dataframe: pd.DataFrame, timestamp_col="Timestamp", date_col="Date"):
+    if dataframe.empty:
+        dataframe["Event Datetime"] = pd.NaT
+        return dataframe
+
+    parsed = dataframe.copy()
+    parsed[timestamp_col] = pd.to_datetime(parsed.get(timestamp_col), errors="coerce")
+    parsed[date_col] = pd.to_datetime(parsed.get(date_col), errors="coerce")
+    parsed["Event Datetime"] = parsed[timestamp_col].combine_first(parsed[date_col])
+    return parsed
+
+
+def merge_assets_with_dispensing(dispensing_df: pd.DataFrame, assets_df: pd.DataFrame) -> pd.DataFrame:
+    dispensing_df = normalize_headers(dispensing_df)
+    assets_df = normalize_headers(assets_df)
+
+    dispensing_df = ensure_string_columns(dispensing_df, ["Fleet No", "Asset ID"])
+    assets_df = ensure_string_columns(assets_df, ["Fleet No", "Asset ID"])
+
+    merged = dispensing_df.merge(
+        assets_df[
+            [
+                "Fleet No",
+                "Asset ID",
+                "Category",
+                "Description",
+                "Plate Number",
+                "Benchmark_KmL",
+            ]
+        ],
+        on="Fleet No",
+        how="left",
+        suffixes=("", "_asset"),
+    )
+
+    fallback_lookup = assets_df.set_index("Asset ID")
+
+    for column in ["Asset ID", "Category", "Description", "Plate Number", "Benchmark_KmL"]:
+        asset_column = f"{column}_asset"
+        if asset_column in merged.columns:
+            merged[column] = merged[asset_column].combine_first(merged[column])
+            merged.drop(columns=[asset_column], inplace=True)
+
+        if column in fallback_lookup.columns:
+            merged[column] = merged[column].combine_first(
+                merged["Asset ID"].map(fallback_lookup[column])
+            )
+
+    merged["Asset Key"] = merged["Fleet No"].fillna("").replace("", pd.NA)
+    merged["Asset Key"] = merged["Asset Key"].combine_first(merged["Asset ID"])
+
+    return merged
+
+
+def build_consumption_metrics(merged_df: pd.DataFrame) -> pd.DataFrame:
+    if merged_df.empty:
+        return pd.DataFrame()
+
+    analytics = merged_df.copy()
+    analytics = analytics.sort_values(["Asset Key", "Event Datetime"])
+    analytics["Previous Meter"] = analytics.groupby("Asset Key")["Current Meter"].shift(1)
+    analytics["Meter Delta"] = analytics["Current Meter"] - analytics["Previous Meter"]
+
+    analytics["Fuel Out (L)"] = pd.to_numeric(analytics["Fuel Out (L)"], errors="coerce")
+    analytics["Meter Delta"] = pd.to_numeric(analytics["Meter Delta"], errors="coerce")
+    analytics["Benchmark_KmL"] = pd.to_numeric(analytics.get("Benchmark_KmL"), errors="coerce")
+
+    analytics["Meter Unit Normalized"] = analytics["Meter Unit"].str.lower().str.strip()
+
+    km_mask = analytics["Meter Unit Normalized"] == "km"
+    hour_mask = analytics["Meter Unit Normalized"].isin(["hour", "hours"])
+
+    analytics.loc[km_mask, "Actual Km/L"] = analytics.loc[km_mask, "Meter Delta"] / analytics.loc[
+        km_mask, "Fuel Out (L)"
+    ]
+    analytics.loc[km_mask, "Efficiency Ratio"] = analytics.loc[km_mask, "Actual Km/L"] / analytics.loc[
+        km_mask, "Benchmark_KmL"
+    ]
+
+    analytics.loc[hour_mask, "Actual L/hour"] = analytics.loc[hour_mask, "Fuel Out (L)"] / analytics.loc[
+        hour_mask, "Meter Delta"
+    ]
+
+    analytics.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+    return analytics
+
+
+def build_data_quality_flags(analytics_df: pd.DataFrame, limits: dict) -> tuple[pd.DataFrame, dict]:
+    if analytics_df.empty:
+        return pd.DataFrame(), {}
+
+    issues = []
+    for _, row in analytics_df.iterrows():
+        reasons = []
+        unit = str(row.get("Meter Unit Normalized", "")).lower()
+        delta = row.get("Meter Delta")
+        fuel_out = row.get("Fuel Out (L)")
+        actual_km_per_l = row.get("Actual Km/L")
+        efficiency_ratio = row.get("Efficiency Ratio")
+
+        if pd.isna(delta) or delta <= 0:
+            reasons.append("Missing/invalid meter delta")
+
+        if pd.isna(fuel_out) or fuel_out <= 0:
+            reasons.append("Fuel Out (L) <= 0")
+
+        if unit not in {"km", "hour", "hours"}:
+            reasons.append("Meter Unit missing or not recognized")
+
+        if unit == "km" and pd.notna(delta) and delta > limits["max_km_delta"]:
+            reasons.append("Extreme km delta")
+
+        if unit in {"hour", "hours"} and pd.notna(delta) and delta > limits["max_hour_delta"]:
+            reasons.append("Extreme hour delta")
+
+        if pd.notna(fuel_out) and fuel_out > limits["max_fuel_out"]:
+            reasons.append("Fuel Out too large")
+
+        if unit == "km" and pd.notna(actual_km_per_l):
+            if actual_km_per_l < limits["min_km_per_l"] or actual_km_per_l > limits["max_km_per_l"]:
+                reasons.append("Efficiency outlier (Km/L)")
+
+        if pd.notna(efficiency_ratio):
+            if (
+                efficiency_ratio < limits["min_efficiency_ratio"]
+                or efficiency_ratio > limits["max_efficiency_ratio"]
+            ):
+                reasons.append("Benchmark efficiency outlier")
+
+        if reasons:
+            issue_row = row.copy()
+            issue_row["Issues"] = "; ".join(reasons)
+            issues.append(issue_row)
+
+    if not issues:
+        return pd.DataFrame(), {}
+
+    issues_df = pd.DataFrame(issues)
+    counts = issues_df["Issues"].str.get_dummies(sep="; ").sum().to_dict()
+    return issues_df, counts
 
 
 def append_row_with_logging(
@@ -498,11 +684,12 @@ def main():
     elif page == "📊 Analytics Dashboard":
         st.title("Fuel Analytics")
 
-        if st.button("🔄 Refresh data", type="secondary"):
+        if st.button("Refresh data", type="secondary"):
             st.cache_data.clear()
             st.cache_resource.clear()
             st.rerun()
 
+        assets_df = safe_load_worksheet_dataframe(sheet_url, "Assets", service_account_json)
         tanker_dispensing_df = safe_load_worksheet_dataframe(
             sheet_url, "Tanker Dispensing", service_account_json
         )
@@ -510,75 +697,283 @@ def main():
             sheet_url, "Tanker Receipts", service_account_json
         )
 
-        tanker_dispensing_df["Date"] = pd.to_datetime(
-            tanker_dispensing_df["Date"], errors="coerce"
-        )
-        tanker_receipts_df["Date"] = pd.to_datetime(
-            tanker_receipts_df["Date"], errors="coerce"
-        )
+        assets_df = normalize_headers(assets_df)
+        tanker_dispensing_df = normalize_headers(tanker_dispensing_df)
+        tanker_receipts_df = normalize_headers(tanker_receipts_df)
+
         tanker_dispensing_df["Fuel Out (L)"] = pd.to_numeric(
             tanker_dispensing_df["Fuel Out (L)"], errors="coerce"
         )
         tanker_receipts_df["Fuel In (L)"] = pd.to_numeric(
             tanker_receipts_df["Fuel In (L)"], errors="coerce"
         )
-
-        dispensing_dates = tanker_dispensing_df["Date"].dropna()
-        receipt_dates = tanker_receipts_df["Date"].dropna()
-        combined_dates = pd.concat([dispensing_dates, receipt_dates])
-
-        if combined_dates.empty:
-            st.error("No valid dates found in Google Sheets. Please verify data entries.")
-            st.stop()
-
-        min_date = combined_dates.min().date()
-        max_date = combined_dates.max().date()
-
-        filter_start, filter_end = st.date_input(
-            "Filter date range",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date,
+        tanker_dispensing_df["Current Meter"] = pd.to_numeric(
+            tanker_dispensing_df["Current Meter"], errors="coerce"
         )
 
-        filtered_dispensing = tanker_dispensing_df[
-            tanker_dispensing_df["Date"].dt.date.between(filter_start, filter_end)
+        tanker_dispensing_df = parse_event_datetime(tanker_dispensing_df)
+        tanker_receipts_df = parse_event_datetime(tanker_receipts_df)
+
+        event_dates = tanker_dispensing_df["Event Datetime"].dropna()
+        if event_dates.empty:
+            st.error("No valid Timestamp/Date data found in Tanker Dispensing worksheet.")
+            st.stop()
+
+        min_date_ts = event_dates.min()
+        max_date_ts = event_dates.max()
+        min_date = min_date_ts.date()
+        max_date = max_date_ts.date()
+        default_start = max_date_ts - pd.Timedelta(days=DEFAULT_DATE_RANGE_DAYS - 1)
+        default_start = max(default_start.date(), min_date)
+
+        merged_dispensing = merge_assets_with_dispensing(tanker_dispensing_df, assets_df)
+        merged_dispensing = build_consumption_metrics(merged_dispensing)
+
+        filter_container = st.container()
+        with filter_container:
+            st.subheader("Filters")
+            col1, col2 = st.columns(2)
+            with col1:
+                filter_start, filter_end = st.date_input(
+                    "Date range",
+                    value=(default_start, max_date),
+                    min_value=min_date,
+                    max_value=max_date,
+                )
+                selected_categories = st.multiselect(
+                    "Category",
+                    options=sorted(
+                        pd.Series(merged_dispensing.get("Category", pd.Series([]))).dropna().unique()
+                    ),
+                )
+                selected_fleet = st.multiselect(
+                    "Fleet No",
+                    options=sorted(merged_dispensing.get("Fleet No", pd.Series([])).dropna().unique()),
+                )
+                selected_asset_ids = st.multiselect(
+                    "Asset ID",
+                    options=sorted(merged_dispensing.get("Asset ID", pd.Series([])).dropna().unique()),
+                )
+            with col2:
+                selected_tankers = st.multiselect(
+                    "Source Tanker",
+                    options=sorted(
+                        merged_dispensing.get("Source Tanker", pd.Series([])).dropna().unique()
+                    ),
+                )
+                meter_unit_filter = st.selectbox(
+                    "Meter Unit",
+                    options=["All", "km", "hour"],
+                    help="Choose whether to show all meter units or filter by kilometers/hours.",
+                )
+                only_with_benchmark = st.checkbox(
+                    "Only show assets with Benchmark_KmL",
+                    value=False,
+                )
+                st.caption("Refresh to reload Google Sheets data")
+
+        filtered_df = merged_dispensing[
+            merged_dispensing["Event Datetime"].dt.date.between(filter_start, filter_end)
         ]
 
-        if filtered_dispensing.empty:
-            st.error("No dispensing data found for the selected date range.")
+        if selected_categories:
+            filtered_df = filtered_df[filtered_df["Category"].isin(selected_categories)]
+
+        if selected_fleet:
+            filtered_df = filtered_df[filtered_df["Fleet No"].isin(selected_fleet)]
+
+        if selected_asset_ids:
+            filtered_df = filtered_df[filtered_df["Asset ID"].isin(selected_asset_ids)]
+
+        if selected_tankers:
+            filtered_df = filtered_df[filtered_df["Source Tanker"].isin(selected_tankers)]
+
+        if meter_unit_filter != "All":
+            if meter_unit_filter == "km":
+                filtered_df = filtered_df[filtered_df["Meter Unit Normalized"] == "km"]
+            else:
+                filtered_df = filtered_df[
+                    filtered_df["Meter Unit Normalized"].isin(["hour", "hours"])
+                ]
+
+        if only_with_benchmark:
+            filtered_df = filtered_df[
+                filtered_df["Benchmark_KmL"].notna()
+                & (pd.to_numeric(filtered_df["Benchmark_KmL"], errors="coerce") > 0)
+            ]
+
+        if filtered_df.empty:
+            st.error("No dispensing data found for the selected filters.")
             st.stop()
 
         kpi1, kpi2, kpi3 = st.columns(3)
-        total_fuel = filtered_dispensing["Fuel Out (L)"].sum()
-        total_entries = len(filtered_dispensing)
+        kpi1.metric("Total Fuel Consumed", f"{filtered_df['Fuel Out (L)'].sum():,.0f} L")
+        kpi2.metric("Total Transactions", len(filtered_df))
+        kpi3.metric("Active Assets", filtered_df["Asset Key"].nunique())
 
-        kpi1.metric("Total Fuel Consumed", f"{total_fuel:,.0f} L")
-        kpi2.metric("Total Transactions", total_entries)
-        kpi3.metric("Active Assets", filtered_dispensing["Fleet No"].nunique())
+        limits_container = st.expander("Data quality limits", expanded=False)
+        with limits_container:
+            col_limit_a, col_limit_b, col_limit_c = st.columns(3)
+            with col_limit_a:
+                max_km_delta = st.number_input(
+                    "Max km per fueling", value=DATA_QUALITY_LIMITS["max_km_delta"], min_value=1
+                )
+                min_km_per_l = st.number_input(
+                    "Min Km/L", value=float(DATA_QUALITY_LIMITS["min_km_per_l"]), min_value=0.0
+                )
+                max_km_per_l = st.number_input(
+                    "Max Km/L", value=float(DATA_QUALITY_LIMITS["max_km_per_l"]), min_value=0.0
+                )
+            with col_limit_b:
+                max_hour_delta = st.number_input(
+                    "Max hours per fueling",
+                    value=DATA_QUALITY_LIMITS["max_hour_delta"],
+                    min_value=1,
+                )
+                max_fuel_out = st.number_input(
+                    "Max Fuel Out (L)",
+                    value=DATA_QUALITY_LIMITS["max_fuel_out"],
+                    min_value=1,
+                )
+            with col_limit_c:
+                min_eff_ratio = st.number_input(
+                    "Min Efficiency Ratio",
+                    value=float(DATA_QUALITY_LIMITS["min_efficiency_ratio"]),
+                    min_value=0.0,
+                    step=0.05,
+                )
+                max_eff_ratio = st.number_input(
+                    "Max Efficiency Ratio",
+                    value=float(DATA_QUALITY_LIMITS["max_efficiency_ratio"]),
+                    min_value=0.0,
+                    step=0.05,
+                )
+
+        limits = {
+            "max_km_delta": max_km_delta,
+            "max_hour_delta": max_hour_delta,
+            "max_fuel_out": max_fuel_out,
+            "min_km_per_l": min_km_per_l,
+            "max_km_per_l": max_km_per_l,
+            "min_efficiency_ratio": min_eff_ratio,
+            "max_efficiency_ratio": max_eff_ratio,
+        }
+
+        issues_df, issue_counts = build_data_quality_flags(filtered_df, limits)
 
         st.markdown("---")
+        st.subheader("Data Quality")
+        col_issue_a, col_issue_b = st.columns([1, 2])
+        with col_issue_a:
+            st.metric("Rows with issues", len(issues_df))
+            if issue_counts:
+                st.write(issue_counts)
+        with col_issue_b:
+            if issues_df.empty:
+                st.success("No data quality issues detected for the current filters.")
+            else:
+                st.dataframe(issues_df[[
+                    "Event Datetime",
+                    "Fleet No",
+                    "Asset ID",
+                    "Source Tanker",
+                    "Fuel Out (L)",
+                    "Current Meter",
+                    "Previous Meter",
+                    "Meter Delta",
+                    "Actual Km/L",
+                    "Actual L/hour",
+                    "Efficiency Ratio",
+                    "Issues",
+                ]], use_container_width=True)
 
-        chart_column_1, chart_column_2 = st.columns(2)
+        st.markdown("---")
+        st.subheader("Asset Performance")
+        perf_col_a, perf_col_b = st.columns(2)
 
-        with chart_column_1:
-            st.subheader("Consumption by Category")
-            chart_data = filtered_dispensing.groupby("Category")["Fuel Out (L)"].sum()
-            st.bar_chart(chart_data)
+        km_rows = filtered_df[
+            (filtered_df["Meter Unit Normalized"] == "km")
+            & filtered_df["Actual Km/L"].notna()
+            & filtered_df["Benchmark_KmL"].notna()
+            & filtered_df["Efficiency Ratio"].notna()
+        ]
+        hour_rows = filtered_df[
+            filtered_df["Meter Unit Normalized"].isin(["hour", "hours"])
+            & filtered_df["Actual L/hour"].notna()
+        ]
 
-        with chart_column_2:
-            st.subheader("Top Consumers (Vehicles)")
+        with perf_col_a:
+            st.caption("Top/Bottom by efficiency ratio (Km/L vs Benchmark)")
+            if km_rows.empty:
+                st.info("No benchmark data available for selected filters.")
+            else:
+                ratio_summary = (
+                    km_rows.groupby("Asset Key")[["Fuel Out (L)", "Efficiency Ratio"]]
+                    .agg({"Fuel Out (L)": "sum", "Efficiency Ratio": "mean"})
+                    .reset_index()
+                )
+                top10 = ratio_summary.sort_values("Efficiency Ratio", ascending=False).head(10)
+                bottom10 = ratio_summary.sort_values("Efficiency Ratio", ascending=True).head(10)
+                st.write("Top 10 Assets by Efficiency Ratio")
+                st.dataframe(top10, use_container_width=True)
+                st.write("Bottom 10 Assets by Efficiency Ratio")
+                st.dataframe(bottom10, use_container_width=True)
+
+        with perf_col_b:
+            st.caption("Hour-meter efficiency and fuel volume leaders")
+            if hour_rows.empty:
+                st.info("No hour-based efficiency data available for selected filters.")
+            else:
+                worst_hours = (
+                    hour_rows.groupby("Asset Key")["Actual L/hour"].mean().sort_values(ascending=False)
+                )
+                st.write("Worst 10 Assets by Actual L/hour")
+                st.dataframe(worst_hours.head(10), use_container_width=True)
+
+        consumer_col1, consumer_col2 = st.columns(2)
+        with consumer_col1:
+            st.caption("Highest fuel consumers")
             top_consumers = (
-                filtered_dispensing.groupby("Fleet No")["Fuel Out (L)"]
-                .sum()
-                .sort_values(ascending=False)
-                .head(5)
+                filtered_df.groupby("Asset Key")["Fuel Out (L)"].sum().sort_values(ascending=False)
             )
-            st.bar_chart(top_consumers)
+            st.bar_chart(top_consumers.head(10))
+        with consumer_col2:
+            st.caption("Most frequent fueling assets")
+            freq_assets = filtered_df.groupby("Asset Key").size().sort_values(ascending=False)
+            st.bar_chart(freq_assets.head(10))
 
-        st.subheader("Recent Transactions")
+        unique_assets = filtered_df["Asset Key"].dropna().unique()
+        if len(unique_assets) == 1:
+            st.markdown("---")
+            st.subheader("Asset Trend")
+            asset_df = filtered_df.sort_values("Event Datetime")
+            asset_df["Rolling Efficiency"] = (
+                asset_df["Actual Km/L"].fillna(asset_df["Actual L/hour"])
+            ).rolling(5, min_periods=1).mean()
+
+            trend_cols = st.columns(3)
+            with trend_cols[0]:
+                st.line_chart(asset_df.set_index("Event Datetime")["Fuel Out (L)"])
+            with trend_cols[1]:
+                st.line_chart(asset_df.set_index("Event Datetime")["Meter Delta"])
+            with trend_cols[2]:
+                st.line_chart(asset_df.set_index("Event Datetime")[["Actual Km/L", "Actual L/hour", "Rolling Efficiency"]])
+        else:
+            st.info("Select exactly one Fleet No or Asset ID to view detailed trend charts.")
+
+        st.markdown("---")
+        st.subheader("Tanker Performance (dispensing)")
+        tanker_group = filtered_df.groupby("Source Tanker")
+        tanker_totals = tanker_group["Fuel Out (L)"].sum().sort_values(ascending=False)
+        tanker_avg = tanker_group["Fuel Out (L)"].mean()
+        st.bar_chart(tanker_totals)
         st.dataframe(
-            filtered_dispensing.sort_values("Date", ascending=False).head(10),
+            pd.DataFrame(
+                {
+                    "Total Fuel Out": tanker_totals,
+                    "Average per dispense": tanker_avg,
+                }
+            ),
             use_container_width=True,
         )
 
@@ -586,14 +981,20 @@ def main():
             st.write(
                 {
                     "row_counts": {
+                        "Assets": len(assets_df),
                         "Tanker Dispensing": len(tanker_dispensing_df),
                         "Tanker Receipts": len(tanker_receipts_df),
+                        "Merged": len(merged_dispensing),
+                        "Filtered": len(filtered_df),
                     },
                     "date_bounds": {
-                        "dispensing_min": dispensing_dates.min(),
-                        "dispensing_max": dispensing_dates.max(),
-                        "receipts_min": receipt_dates.min(),
-                        "receipts_max": receipt_dates.max(),
+                        "dispensing_min": event_dates.min(),
+                        "dispensing_max": event_dates.max(),
+                    },
+                    "metric_counts": {
+                        "km_rows": len(km_rows),
+                        "hour_rows": len(hour_rows),
+                        "quality_issues": len(issues_df),
                     },
                     "current_filter_range": {
                         "start": filter_start,
